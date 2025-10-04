@@ -1,0 +1,90 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {ITrap} from "drosera-contracts/interfaces/ITrap.sol";
+
+interface IUniswapV2Pair {
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+}
+
+contract SergeantCatcherTriangulate is ITrap {
+    address public primaryPair;
+    address public secondaryPair;
+    uint256 public thresholdBp;
+    uint256 public priceDivBp;
+    uint256 public cooldownBlocks;
+    uint256 public minLiquidity;
+    uint256 public lastTriggeredBlock;
+
+    event TriggerRecorded(uint256 blockNumber, uint256 dropPbp, uint256 dropSbp, uint256 priceDivBp);
+
+    constructor(
+        address _primaryPair,
+        address _secondaryPair,
+        uint256 _thresholdBp,
+        uint256 _priceDivBp,
+        uint256 _cooldownBlocks,
+        uint256 _minLiquidity
+    ) {
+        primaryPair = _primaryPair;
+        secondaryPair = _secondaryPair;
+        thresholdBp = _thresholdBp;
+        priceDivBp = _priceDivBp;
+        cooldownBlocks = _cooldownBlocks;
+        minLiquidity = _minLiquidity;
+    }
+
+    function collect() external view override returns (bytes memory) {
+        (uint112 pR0, uint112 pR1, ) = IUniswapV2Pair(primaryPair).getReserves();
+        (uint112 sR0, uint112 sR1, ) = IUniswapV2Pair(secondaryPair).getReserves();
+        return abi.encode(uint256(pR0), uint256(pR1), uint256(sR0), uint256(sR1));
+    }
+
+    function shouldRespond(bytes calldata _data) external view override returns (bool) {
+        (
+            uint256 prevP_r0, uint256 prevP_r1, uint256 prevS_r0, uint256 prevS_r1,
+            uint256 currP_r0, uint256 currP_r1, uint256 currS_r0, uint256 currS_r1
+        ) = abi.decode(_data, (uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256));
+
+        if ((prevP_r0 &lt; minLiquidity &amp;&amp; prevP_r1 &lt; minLiquidity) ||
+            (prevS_r0 &lt; minLiquidity &amp;&amp; prevS_r1 &lt; minLiquidity)) return false;
+
+        if (prevP_r0 == 0 || prevP_r1 == 0 || prevS_r0 == 0 || prevS_r1 == 0) return false;
+        if (currP_r0 == 0 || currP_r1 == 0 || currS_r0 == 0 || currS_r1 == 0) return false;
+
+        uint256 dropPbp = _percentDropBp(prevP_r0, currP_r0, prevP_r1, currP_r1);
+        uint256 dropSbp = _percentDropBp(prevS_r0, currS_r0, prevS_r1, currS_r1);
+
+        if (!(dropPbp &gt;= thresholdBp &amp;&amp; dropSbp &gt;= thresholdBp)) return false;
+
+        uint256 priceP = (currP_r1 * 1e18) / currP_r0;
+        uint256 priceS = (currS_r1 * 1e18) / currS_r0;
+        uint256 priceDivBpCalculated = _absPercentDiffBp(priceP, priceS);
+
+        if (!(priceDivBpCalculated &gt;= priceDivBp)) return false;
+
+        if (block.number &lt;= lastTriggeredBlock + cooldownBlocks) return false;
+
+        return true;
+    }
+
+    function recordTrigger(uint256 _dropPbp, uint256 _dropSbp, uint256 _priceDivBp) external {
+        lastTriggeredBlock = block.number;
+        emit TriggerRecorded(block.number, _dropPbp, _dropSbp, _priceDivBp);
+    }
+
+    function _percentDropBp(uint256 prev0, uint256 curr0, uint256 prev1, uint256 curr1) internal pure returns (uint256) {
+        uint256 drop0 = (prev0 &gt; curr0) ? (prev0 - curr0) * 10000 / prev0 : 0;
+        uint256 drop1 = (prev1 &gt; curr1) ? (prev1 - curr1) * 10000 / prev1 : 0;
+        return (drop0 &gt;= drop1) ? drop0 : drop1;
+    }
+
+    function _absPercentDiffBp(uint256 a, uint256 b) internal pure returns (uint256) {
+        if (a == b) return 0;
+        uint256 larger = (a &gt; b) ? a : b;
+        uint256 smaller = (a &gt; b) ? b : a;
+        return ( (larger - smaller) * 10000 ) / larger;
+    }
+}
